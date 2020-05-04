@@ -1,0 +1,1241 @@
+### CDSRG
+
+### determineLOS()
+# The purposes of this function are to identify acute inpatient hospital stays in the VA CDW and to calculate the lengths of these stays.
+# This function requires four tables to exist in the VA VINCI database it queries: 
+#       Inpat_Inpatient, Inpat_PatientTransfer, Fee_FeeInpatInvoice, and CohortCrosswalk
+
+### first draft: 23 January 2020
+### last edit: 4 May 2020
+
+################################################################################
+################################################################################
+
+
+
+
+determineLOS <- 
+  function(serverName = NULL, dbName = NULL, desiredLag = 24, writeToDB = TRUE) {
+    
+    ### prepare package dependencies 
+
+    suppressPackageStartupMessages(require("spatstat"))
+    
+    suppressPackageStartupMessages(require("logger"))
+    
+    ################################################################################
+    ################################################################################
+    ################################################################################
+    ### prepare internal functions 
+    
+    ################################################################################
+    ### makeCon()
+    ### function for establishing an RODBC connection to a database
+    
+    makeCon <- function(serverName, dbName) {
+      
+      ### install RODBC package
+      
+      suppressPackageStartupMessages(require("RODBC"))
+      
+      ### build connection name and establish connection
+      
+      conString <- paste("driver={SQL Server};server=", serverName, ";database=", dbName, ";trusted_connection=TRUE", sep = "")
+      con <- odbcDriverConnect(connection = conString)
+      
+      ### error handling
+      ###### invalid server name
+      ###### invalid db name or db user doesn't have permission for
+      
+      ### return connection
+      
+      return(con)
+      
+    }
+    
+    ################################################################################
+    ### prepQuery()
+    ### function for properly setting up to retrieve data from a database using RODBC
+    
+    prepQuery <- function(con, query=NULL, rows_at_time=attr(con, "rows_at_time")) {
+      # test database connection and clear error log
+      if (!RODBC:::odbcValidChannel(con)) {
+        log_error("Invalid DB connection")
+        return(FALSE)
+      }
+      tryCatch(
+        odbcClearError(con),
+        error=function(e) {
+          log_error(e$message)
+          return(FALSE)
+        }
+      )
+      if (is.null(query)) {
+        log_error("Missing value for 'query'")
+        return(FALSE)
+      }
+      if (!is.character(query)) {
+        log_warn("Converting from non-character value provided for 'query'")
+        query <- as.character(query)
+      }
+      if (length(query) != 1) {
+        log_error("Single value required for 'query'")
+        return(FALSE)
+      }
+      if (nchar(query) < 1) {
+        log_error("Empty 'query' provided")
+        return(FALSE)
+      }
+      log_info("Prepping query: ", query)	
+      if (.Call(RODBC:::C_RODBCQuery, attr(con, "handle_ptr"), query, as.integer(rows_at_time)) < 0) {
+        log_error("Error evaluating query using provided DB connection")
+        log_error(odbcGetErrMsg(con))
+        return(FALSE)
+      }
+      return(TRUE)
+    }
+    
+    ################################################################################
+    ### fetchQuery()
+    ### function to retrieve data from a database in chunks and apply another function to the data
+    
+    fetchQuery <- function(con, n=NULL, buffsize=1000, FUN=NULL, as.is=FALSE, ...) {
+      # test database connection
+      if (!RODBC:::odbcValidChannel(con)) {
+        log_error("Invalid DB connection")
+        return(FALSE)
+      }
+      cols <- .Call(RODBC:::C_RODBCNumCols, attr(con, "handle_ptr"))
+      if (cols < 0L) {
+        log_error("No data")
+        return(FALSE)
+      }
+      cData <- .Call(RODBC:::C_RODBCColData, attr(con, "handle_ptr"))
+      if (!is.numeric(n) | (length(n) != 1)) { 
+        n <- 0
+      }
+      n <- max(0, floor(n), na.rm=TRUE)
+      if (is.logical(as.is) & length(as.is) == 1) {
+        as.is <- rep(as.is, length=cols)
+      }
+      else if (is.numeric(as.is)) {
+        if (any(as.is < 1 | as.is > cols)) 
+          log_warn("invalid numeric 'as.is' values: ", as.is[which(as.is < 1 | as.is > cols)])
+        as.is <- as.is[which(as.is >= 1 & as.is <= cols)]
+        i <- rep(FALSE, cols)
+        i[as.is] <- TRUE
+        as.is <- i
+      }
+      else if (is.character(as.is)) {
+        as.is <- cData$names %in% as.is
+      }
+      if (length(as.is) != cols) {
+        log_error("'as.is' has the wrong length ", length(as.is), " != cols = ", cols)
+        return(FALSE)
+      }
+      as.is <- which(as.is)
+      if (is.null(FUN)) {
+        FUN <- return
+        use.dots <- FALSE
+      }
+      else {
+        tryCatch(
+          FUN <- match.fun(FUN),
+          error=function(e) {
+            log_error(e$message)
+            return(FALSE)				
+          }
+        )
+        use.dots <- (...length() > 0L) & (length(formals(FUN)) > 1L)
+      }
+      counter <- 0
+      nresults <- 0
+      repeat {
+        data <- .Call(RODBC:::C_RODBCFetchRows, attr(con, "handle_ptr"), n, buffsize, NA_character_, TRUE)
+        if ((data$stat) < 0L) {
+          if (counter > 0L) {
+            log_info("Completed fetch (", nresults, " results)")
+          }
+          else if (data$stat == -1) {
+            log_error(odbcGetErrMsg(con))
+          }
+          break
+        }
+        log_info("Fetching query results", 
+                 if (n > 0) { 
+                   paste(" (", floor(counter*n), "-", (counter+1)*n-1, ")", sep="") 
+                 }
+                 else {
+                   " (all)"
+                 }
+        )
+        counter <- counter + 1
+        names(data$data) <- cData$names
+        for (i in as.is) {
+          tryCatch(
+            switch(cData$type[i],
+                   int = data$data[[i]] <- as.integer(data$data[[i]]),
+                   smallint = data$data[[i]] <- as.integer(data$data[[i]]),
+                   decimal = data$data[[i]] <- as.numeric(data$data[[i]]),
+                   date = data$data[[i]] <- as.Date(data$data[[i]]),
+                   timestamp = data$data[[i]] <- as.POSIXct(data$data[[i]]),
+                   unknown = data$data[[i]] <- type.convert(data$data[[i]])
+            ),
+            error=function(e) {
+              log_warn("Error converting ", cData$names[i], ": ", e$message)
+            }
+          )
+        }
+        tryCatch(
+          if (use.dots) {
+            forceAndCall(1, FUN, data$data, ...)
+          }
+          else {
+            forceAndCall(1, FUN, data$data)
+          },
+          error=function(e) {
+            log_error(e$message)
+            log_error(odbcGetErrMsg(con))
+            return(FALSE)
+          }
+        )
+        nresults <- nresults + length(data$data[[1]])
+      }
+      return(TRUE)
+    }
+    
+    ################################################################################
+    ### makeLog()
+    ### function to install logger package and set up logging file
+    
+    makeLog <- function(dbName) {
+      
+      ### install logger package
+      
+      suppressPackageStartupMessages(require("logger"))
+      
+      ### acquire current date and format for using in file name
+      
+      today <- Sys.Date()
+      today <- format(today, format = "%Y%m%d")
+      
+      ### instantiate file
+      
+      logfile <- paste("P:/", dbName, "/", today, "_identifyCourses.log", sep = "")
+      log_appender(appender_file(logfile), index=2)
+      
+      return(TRUE)
+      
+    }
+    
+    ################################################################################
+    ### function for populating R hash environment with patient stay data
+    
+    storeInHash <- function(x) {
+      
+      x$PatientICN <- as.character(x$PatientICN)
+      x$InpatientSID <- as.numeric(x$InpatientSID)
+      x$AdmitDateTime <- as.character(x$AdmitDateTime)
+      x$PatientTransferDateTime  <- as.character(x$PatientTransferDateTime)
+      x$DischargeDateTime <- as.character(x$DischargeDateTime)
+      x$AdmitToSpecialty <- as.character(x$AdmitToSpecialty)
+      x$TransferToSpecialty <- as.character(x$TransferToSpecialty)
+      
+      temp <- function(ICN, ISID, ADT, PTDT, DDT, AtS, TtS) {
+        
+        ptdata <- patenv[[ICN]]
+        
+        if (is.null(ptdata)) {
+          
+          
+          ptdata <- data.frame("PatientICN" = numeric(), "InpatientSID" = numeric(), "AdmitDateTime" = character(), 
+                               "PatientTransferDateTime" = character(), "DischargeDateTime" = character(),  
+                               "AdmitToSpecialty" = character(), "TransferToSpecialty" = character())
+          
+        }
+        
+        newRow <- data.frame(as.numeric(ICN), ISID, ADT, PTDT, DDT, AtS, TtS, stringsAsFactors = FALSE)
+        colnames(newRow) <- c("PatientICN", "InpatientSID", "AdmitDateTime", "PatientTransferDateTime", "DischargeDateTime", 
+                              "AdmitToSpecialty", "TransferToSpecialty")
+        
+        ptdata <- rbind(ptdata, newRow, stringsAsFactors = FALSE, make.row.names = FALSE)
+        
+        patenv[[ICN]] <- ptdata
+        
+      }
+      
+      mapply(temp, x$PatientICN, x$InpatientSID, x$AdmitDateTime, x$PatientTransferDateTime, x$DischargeDateTime, x$AdmitToSpecialty, x$TransferToSpecialty)
+      return()
+      
+    }
+    
+    ################################################################################
+    ### function to categorize clinical specialties
+    
+    Specialty <- c("NULL",
+                   "*Missing*",
+                   "ACUTE PSYCHIATRY (<45 DAYS)",
+                   "ALCOHOL DEPENDENCE TRMT UNIT",
+                   "AUTHORIZED NON-VA HOSPITAL CARE FOR SC COND.",                                        
+                   "BLIND REHAB",
+                   "CARDIAC INTENSIVE CARE UNIT",
+                   "CARDIAC-STEP DOWN UNIT",
+                   "CARDIOLOGY",
+                   "CNH HOSPICE",
+                   "CNH RESPITE CARE",
+                   "COMMUNITY NURSING HOME FOR NSC DISABILITY(IES)",                                      
+                   "COMMUNITY NURSING HOME FOR SC DISABILITY(IES)",                                       
+                   "DOMICILIARY",
+                   "DOMICILIARY CHV",
+                   "DOMICILIARY PTSD",
+                   "DOMICILIARY SUBSTANCE ABUSE",
+                   "DOMICILIARY SUBSTANCE USE DO",
+                   "EAR, NOSE, THROAT (ENT)",
+                   "ED OBSERVATION",
+                   "EMERG. NON-VA CARE (INPT/OPT) FOR VET. REC. INPT. CARE IN VAMC",                      
+                   "EMERG. NON-VA CARE (INPT/OPT) VET. REC. CARE IN FED. HOSP. AT VA EXP.",               
+                   "EVAL/BRF TRMT PTSD UNIT(EBTPU)",
+                   "GASTROENTEROLOGY",
+                   "GEM ACUTE MEDICINE",
+                   "GEM INTERMEDIATE CARE",
+                   "GEN INTERMEDIATE PSYCH",
+                   "GEN MEDICINE (ACUTE)",
+                   "GENERAL CWT/TR",
+                   "GENERAL SURGERY",
+                   "GENERAL(ACUTE MEDICINE)",
+                   "HEMATOLOGY/ONCOLOGY",
+                   "HIGH INTENSITY GEN PSYCH INPAT",
+                   "HOMELESS CWT/TRANS RESID",
+                   "HOSPICE CARE (INPT.) CONTRACT/SHARING AGREEMENT",                                     
+                   "HOSPICE FOR ACUTE CARE",
+                   "INPATIENT 38 U.S.C. 1725",
+                   "INTERMEDIATE MEDICINE",
+                   "MEDICAL ICU",
+                   "MEDICAL OBSERVATION",
+                   "MEDICAL STEP DOWN",
+                   "METABOLIC",
+                   "NEUROLOGY",
+                   "NEUROLOGY OBSERVATION",
+                   "NEUROSURGERY",
+                   "NH GEM NURSING HOME CARE",
+                   "NH HOSPICE",
+                   "NH LONG STAY DEMENTIA CARE",
+                   "NH LONG STAY SPINAL CORD INJ",
+                   "NH LONG-STAY CONTINUING CARE",
+                   "NH LONG-STAY MH RECOVERY",
+                   "NH RESPITE CARE (NHCU)",
+                   "NH SHORT STAY DEMENTIA CARE",
+                   "NH SHORT STAY REHABILITATION",
+                   "NH SHORT STAY SKILLED NURSING",
+                   "NH SHORT-STAY CONTINUING CARE",
+                   "NH SHORT-STAY MH RECOVERY",
+                   "NHCU",
+                   "NON-VA HOSP. CARE FOR NSC COND. (AK, VI AND HI ONLY)",
+                   "NON-VA HOSP. CARE FOR VET. REC. INPT. CARE IN FED. HOSP. AT VA EXP.",                 
+                   "NON-VA HOSP. CARE FOR WOMEN VETERANS (NO OTHER ELIGIBILITY). INCLUDES MATERNITY CARE",
+                   "OB/GYN",
+                   "OPHTHALMOLOGY",
+                   "ORTHOPEDIC",
+                   "PERIPHERAL VASCULAR",
+                   "PLASTIC SURGERY",
+                   "PSYCH RESID REHAB PROG",
+                   "PSYCH RESID REHAB TRMT PROG",
+                   "PSYCHIATRIC OBSERVATION",
+                   "PSYCHIATRY",
+                   "PTSD RESID REHAB PROG",
+                   "PTSD RESIDENTIAL REHAB PROG",
+                   "PULMONARY, NON-TB",
+                   "REHAB MEDICINE OBSERVATION",
+                   "REHABILITATION MEDICINE",
+                   "RESPITE CARE (MEDICINE)",
+                   "SIPU (SPEC INPT PTSD UNIT)",
+                   "SPINAL CORD INJURY",
+                   "STAR I, II & III",
+                   "SUBSTANCE ABUSE INTERMED CARE",
+                   "SUBSTANCE ABUSE RES TRMT PROG",
+                   "SUBSTANCE ABUSE RESID PROG",
+                   "SUBSTANCE ABUSE TRMT UNIT",
+                   "SURGICAL ICU","SURGICAL OBSERVATION",
+                   "SURGICAL STEPDOWN",
+                   "TELEMETRY",
+                   "THORACIC SURGERY",
+                   "UNAUTHORIZED NON-VA HOSPITAL CARE, SC OR NSC COND",
+                   "UROLOGY",
+                   "VASCULAR")
+    
+    Category <- c("nonacute",
+                  "nonacute",
+                  "acute",
+                  "nonacute",
+                  "acute",
+                  "nonacute", 
+                  "acute",
+                  "acute",
+                  "acute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "nonacute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "nonacute",
+                  "nonacute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "nonacute",
+                  "nonacute",
+                  "acute",
+                  "acute",
+                  "nonacute",
+                  "nonacute",
+                  "acute",
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",   
+                  "nonacute",
+                  "nonacute",
+                  "nonacute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute",
+                  "acute")
+    
+    catSpecialties <- lut(inputs = Specialty, outputs = Category)
+    
+    ################################################################################
+    ### function to assess segments of inpatient stays for contiguity and 
+    # concatenate them where appropriate
+    
+    ### parameters: x, desiredLag
+    # x is a dataframe with 3 columns: PatientICN, BeginDateTime, EndDateTime
+    # desiredLag is an integer representing the maximum number of hours difference allowed
+    # between two segments considered contiguous (default is 24)
+    
+    assessSegments <- function(x, desiredLag) {
+      
+      if (is.null(desiredLag)) { 
+        
+        timeLag = 24 
+        
+      } else {
+        
+        timeLag = desiredLag
+        
+      }
+      
+      ### ensure no duplicate rows exist
+      
+      x <- unique(x)
+      
+      ### determine chronological order of date values in both BeginDateTime and EndDateTime
+      
+      beginDates <- sort(x$BeginDateTime)
+      endDates <- sort(x$EndDateTime)
+      
+      ### identify any nested time segments and remove inner segment
+      
+      beginOrder <- order(x$BeginDateTime)
+      endOrder <- order(x$EndDateTime)
+      
+      beginRank <- rank(x$BeginDateTime)
+      endRank <- rank(x$EndDateTime)
+      
+      ### instantiate flag column
+      
+      x$flagNest <- NA
+      
+      for (n in 1:nrow(x)) {
+        
+        if (is.na(x[n, "flagNest"])) {
+          
+          if (beginOrder[n] < endOrder[n]) {
+            
+            x[which(beginRank==beginOrder[n]), "flagNest"] <- "inner"
+            x[which(endRank==beginOrder[n]), "flagNest"] <- "outer"
+            
+          } else if (beginOrder[n] > endOrder[n]) {
+            
+            x[which(beginRank==beginOrder[n]), "flagNest"] <- "outer"
+            x[which(endRank==beginOrder[n]), "flagNest"] <- "inner"
+            
+          }
+          
+        }
+        
+      }
+      
+      ### retain outer of nested segments and non-nested segments (delete inner of nested segments)
+      ### remove flag column
+      
+      xOuter <- x[which(x$flagNest == "outer"), 1:3]
+      xNonnested <- x[which(is.na(x$flagNest)), 1:3]
+      x <- rbind(xOuter, xNonnested, stringsAsFactors = FALSE)
+      
+      ### ensure no duplicate rows exist
+      
+      x <- unique(x)
+      
+      ### check for instances of repeated values of BeginDateTime
+      
+      if (length(sort(x$BeginDateTime)) == length(unique(sort(x$BeginDateTime)))) {
+        
+        ### proceed with manipulations if no instances of repeated values
+        
+        patStays <- concatenateSegments(x, desiredLag)
+        
+      } else {
+        
+        ### account for repeated values of BeginDateTime
+        ### note: held to be true that no value could occur more than twice (logic of derivation from sources supports this)
+        
+        ### instantiate empty data frames for isolating the longer segment of any two segments with the same BeginDateTime value
+        ### shorter segments will be assessed for potential concatenation first
+        
+        waitingSegs <- as.data.frame(matrix(ncol = 3, nrow = 0))   
+        colnames(waitingSegs) <- colnames(x)
+        
+        nowSegs <- as.data.frame(matrix(ncol = 3, nrow = 0))   
+        colnames(nowSegs) <- colnames(x)
+        
+        ### evaluate each value of beginDates to check if it is identical with the following value
+        
+        for (n in 1:(length(beginDates) - 1)) {
+          
+          ### if two values of beginDates are identical, separate the two corresponding rows
+          
+          if (beginDates[n] == beginDates[(n + 1)]) {
+            
+            ### create a subset of the data frame of all segments with only the corresponding rows
+            
+            dups <- x[which(x$BeginDateTime == beginDates[n]),]
+            
+            ### the longer segment goes into the waitingSegs data frame
+            ### the shorter segment goes into the nowSegs data frame 
+            
+            if (dups$EndDateTime[1] > dups$EndDateTime[2]) {
+              
+              waitingSegs <- rbind(waitingSegs, dups[1,], stringsAsFactors = FALSE)
+              nowSegs <- rbind(nowSegs, dups[2,], stringsAsFactors = FALSE)
+              
+            } else {
+              
+              waitingSegs <- rbind(waitingSegs, dups[2,], stringsAsFactors = FALSE)
+              nowSegs <- rbind(nowSegs, dups[1,], stringsAsFactors = FALSE)
+              
+            }
+            
+            rm(dups)
+            
+          } else {
+            
+            ### if the current value of BeginDateTime is not a duplicate, add the corresponding row to the nowSegs data frame
+            
+            nowSegs <- rbind(nowSegs, x[which(x$BeginDateTime == beginDates[n]),], stringsAsFactors = FALSE)
+            
+          }
+          
+          ### remove just processed rows from the data frame of all segments
+          
+          x <- x[which(x$BeginDateTime != beginDates[n]),]
+          
+        }
+        
+        ### add any final row remaining in data frame of all segments to the nowSegs data frame
+        
+        if (nrow(x) > 0) {
+          
+          nowSegs <- rbind(nowSegs, x, stringsAsFactors = FALSE)
+          
+        }
+        
+        rm(x)
+        
+        ### assess nowSegs dataframe for possible concatenation
+        
+        nowSegs <- concatenateSegments(nowSegs, desiredLag)
+        
+        ### add held segments to processed segments
+        
+        patStays <- rbind(nowSegs, waitingSegs, stringsAsFactors = FALSE)
+        
+        ### identify and remove any duplicate rows
+        
+        patStays <- unique(patStays)
+        
+        ### assess all segments for possible concatenation
+        
+        patStays <- concatenateSegments(patStays, desiredLag)
+        
+      }
+      
+      ### identify and remove any duplicate rows
+      
+      patStays <- unique(patStays)   
+      
+      ### return processed data frame
+      
+      return(patStays)
+      
+    }
+    
+    ################################################################################
+    ### The purpose of this function is to determine the length of the gap between two consecutive segments of time.
+    ### In instances of that gap being sufficiently short (default is 24 hours), the segments are concatenated.
+    
+    ### parameters: a data frame with 3 columns: PatientICN, BeginDateTime, EndDateTime and the desired maximum gap between concatenatable segments (in hours)
+    
+    concatenateSegments <- function(x, desiredLag) {
+      
+      if (is.null(desiredLag)) { 
+        
+        timeLag = 24 
+        
+      } else {
+        
+        timeLag = desiredLag
+        
+      }
+      
+      ### determine chronological order of date values in both BeginDateTime and EndDateTime
+      
+      beginDates <- sort(x$BeginDateTime)
+      endDates <- sort(x$EndDateTime)
+      
+      ### instantiate intermediary data frame with first segment
+      
+      segment <- x[which(x$BeginDateTime == beginDates[1]),]
+      
+      segment$PreviousWasContiguous <- "first segment"
+      
+      patData <- segment
+      
+      ### assess remaining segments of stays, if any, 
+      ### differentiating segments representing discrete and complete stays 
+      ### and concatenating contiguous consecutive stays
+      
+      if (length(beginDates) > 1) {
+        
+        for (n in 2:length(beginDates)) {
+          
+          segment <- x[which(x$BeginDateTime == beginDates[n]),]
+          
+          thisBegin <- beginDates[n]
+          previousEnd <- endDates[(n - 1)]
+          
+          ### compute time difference between current BeginDateTime and previous EndDateTime 
+          
+          diff <- thisBegin - previousEnd
+          
+          ### coerce units of time difference to hours
+          
+          units(diff) <- "hours"
+          
+          ### coerce class of time difference to numeric
+          
+          diff <- as.numeric(diff)
+          
+          ### check time difference and populate intermediary data frame appropriately
+          ### default: DIFFERENCES OF FEWER THAN 24 HOURS ARE CONSIDERED "CONTIGUOUS" 
+          
+          if (diff < timeLag) {
+            segment$PreviousWasContiguous <- "yes"
+          } else {
+            segment$PreviousWasContiguous <- "no"
+          }
+          
+          patData <- rbind(patData, segment)
+          
+        }
+        
+      }
+      
+      ### tidy
+      
+      rm(beginDates)
+      rm(endDates)   
+      
+      ### adjust row numbers of data frame (could be funky from sorting)
+      
+      rownames(patData) <- NULL
+      
+      ### process potentially contiguous segments
+      ### instantiate data frame to hold output
+      
+      patStays <- as.data.frame(matrix(ncol = 3, nrow = 0))
+      colnames(patStays) <- c("PatientICN", "BeginDateTime", "EndDateTime")
+      
+      ### process
+      
+      while (nrow(patData) > 0) {
+        
+        ### determine REVERSE chronological order of date values in EndDateTime
+        
+        endDates <- sort(patData$EndDateTime, decreasing = TRUE)
+        
+        counter <- 1
+        
+        ### store the EndDateTime value for last segment (chronologically)
+        
+        EDT <- endDates[counter]
+        
+        ### check if the preceding segment is contiguous with the current segment
+        
+        checkPrevious <- patData$PreviousWasContiguous[which(patData$EndDateTime == endDates[counter])]
+        
+        ### as long as the preceding segment is contiguous with the current segment, 
+        ### make the current BeginDateTime value null and check the next preceding segment
+        
+        while (checkPrevious == "yes") {
+          
+          patData$BeginDateTime[which(patData$EndDateTime == endDates[counter])] <- NA
+          
+          counter <- counter + 1
+          
+          if (!is.na(endDates[counter])) {
+            
+            checkPrevious <- patData$PreviousWasContiguous[which(patData$EndDateTime == endDates[counter])]
+            
+          } else {
+            
+            checkPrevious <- "no"
+            
+          }
+          
+        }
+        
+        ### store the patient identifier and BeginDateTime values for the earliest contiguous segment (chronologically)
+        
+        thisStay <- patData[which(patData$EndDateTime == endDates[counter]), c("PatientICN", "BeginDateTime")]
+        
+        ### add previously stored EndDateTime
+        
+        thisStay$EndDateTime <- EDT
+        
+        ### add this row to output data frame
+        
+        patStays <- rbind(patStays, thisStay, stringsAsFactors = FALSE)
+        
+        ### remove rows from the intermediary output data frame in which BeginDateTime has been made null
+        
+        patData <- patData[which(!is.na(patData$BeginDateTime)),]
+        
+        ### make EndDateTime values in processed rows null
+        
+        patData$EndDateTime[which(patData$EndDateTime >= endDates[counter])] <- NA
+        
+        ### remove rows from the intermediary output data frame in which EndDateTime has been made null
+        
+        patData <- patData[which(!is.na(patData$EndDateTime)),]
+        
+      }
+      
+      ### tidy
+      
+      rm(patData)
+      patStays <- unique(patStays)
+      rownames(patStays) <- NULL    
+      
+      return(patStays)
+      
+    }
+    
+    ################################################################################
+    ################################################################################
+    ################################################################################
+    ### prepare output files
+    
+    ### acquire current date and format for using in output file names
+    
+    today <- Sys.Date()
+    today <- format(today, format = "%Y%m%d")
+    
+    ### create constant holding the time of one second past midnight (no date) to be used later in manipulating data from the fee-basis tables
+    
+    midnight <- as.POSIXct("2020-01-01 00:00:01")
+    midnight <- format(midnight, format = "%H:%M:%S")
+    
+    ### instantiate database and server variables from provided parameters
+    
+    VINCIserver <- serverName
+    VINCIdatabase <- dbName
+    
+    ### build connection name and establish connection
+    
+    conString <- paste("driver={SQL Server};server=", VINCIserver, ";database=", VINCIdatabase, ";trusted_connection=TRUE", sep = "")
+    con <- odbcDriverConnect(connection = conString)
+    
+    ################################################################################
+    ### establish logging and output log file
+    
+    logfile <- paste("P:/", VINCIdatabase, "/", today, "_determineLOS.log", sep = "")
+    log_appender(appender_file(logfile), index=2)
+    
+    ################################################################################
+    ### establish file to hold all patient stays
+    
+    stayfile <- paste("P:/", VINCIdatabase, "/", today, "_PatientStays.csv", sep = "")
+    file.create(stayfile)
+    fCon <- file(stayfile)
+    open(fCon, open = "a")
+    fileHeader <- paste("PatientICN", "BeginDateTime", "EndDateTime", "LOS", sep = ",")
+    fileHeader <- paste(fileHeader, " \n", sep = "")
+    cat(fileHeader, file = fCon)
+    
+    
+    ################################################################################
+    ################################################################################
+    ################################################################################
+    ### build query to retrieve relevant patient data
+    
+    querySELECT <- 
+      "SELECT DISTINCT PatientICN, a.InpatientSID, a.AdmitDateTime, PatientTransferDateTime, a.DischargeDateTime, f.Specialty AS AdmitToSpecialty, g.Specialty AS TransferToSpecialty"
+    
+#    queryFROMdb <- paste("FROM ", VINCIdatabase, ".Src.Inpat_Inpatient a LEFT OUTER JOIN ", VINCIdatabase, 
+#                         ".Src.Inpat_PatientTransfer b ON a.InpatientSID = b.InpatientSID LEFT OUTER JOIN ", 
+#                         VINCIdatabase, ".Src.CohortCrosswalk c ON a.PatientSID = c.PatientSID", sep = "")
+
+    queryFROMdim <- "LEFT OUTER JOIN CDWWork.Dim.WardLocation d ON a.AdmitWardLocationSID = d.WardLocationSID"
+    queryFROMdim <- paste(queryFROMdim, "LEFT OUTER JOIN CDWWork.Dim.WardLocation e ON b.GainingWardLocationSID = e.WardLocationSID", sep = " ")
+    queryFROMdim <- paste(queryFROMdim, "LEFT OUTER JOIN CDWWork.Dim.Specialty f ON d.SpecialtySID = f.SpecialtySID", sep = " ")
+    queryFROMdim <- paste(queryFROMdim, "LEFT OUTER JOIN CDWWork.Dim.Specialty g ON e.SpecialtySID = g.SpecialtySID", sep = " ")
+    
+    ##### FOR KENNY'S DB ONLY #####
+    queryFROMdb <- paste("FROM ", VINCIdatabase, ".Src.Inpat_Inpatient a LEFT OUTER JOIN ", VINCIdatabase, 
+                         ".Src.Inpat_PatientTransfer b ON a.InpatientSID = b.InpatientSID LEFT OUTER JOIN ", 
+                         VINCIdatabase, ".Src.SPatient_SPatient c ON a.PatientSID = c.PatientSID", sep = "")
+    
+    
+    
+    
+    query <- paste(querySELECT, queryFROMdb, queryFROMdim, sep = " ")
+    
+    querySELECT <- 
+      "UNION SELECT DISTINCT PatientICN, NULL, TreatmentFromDateTime, NULL, TreatmentToDateTime, FeePurposeOfVisit, NULL"
+    
+#    queryFROMdb <- paste("FROM ", VINCIdatabase, ".Src.Fee_FeeInpatInvoice a LEFT OUTER JOIN ", 
+#                        VINCIdatabase, ".Src.CohortCrosswalk c ON a.PatientSID = c.PatientSID", sep = "")
+   
+    ##### FOR KENNY'S DB ONLY #####
+    queryFROMdb <- paste("FROM ", VINCIdatabase, ".Src.Fee_FeeInpatInvoice a LEFT OUTER JOIN ", 
+                         VINCIdatabase, ".Src.SPatient_SPatient c ON a.PatientSID = c.PatientSID", sep = "")
+    
+    
+    queryFROMdim <- "LEFT OUTER JOIN CDWWork.Dim.FeePurposeOfVisit d ON a.FeePurposeOfVisitSID = d.FeePurposeOfVisitSID"
+
+    query <- paste(query, querySELECT, queryFROMdb, queryFROMdim, sep = " ")
+    
+    ################################################################################
+    ################################################################################
+    ################################################################################
+    
+    ### create environment
+    
+    patenv <- new.env(hash = TRUE)
+    
+    ### retrieve data and populate environment
+    
+    prepQuery(con, query)
+    fetchQuery(con, n = 100000, FUN = storeInHash)
+    
+    ### create list of individual patients
+    
+    pats <- ls(envir = patenv)
+    
+    ################################################################################
+    ################################################################################
+    ################################################################################  
+ 
+    ### process all patient data
+    
+    for (pat in pats) {
+      
+      ### create temporary copy of patient's data for processing
+      
+      thisPat <- patenv[[pat]]
+      
+      ### remove rows without a discharge date (patient is still admitted at time of processing)
+      
+      thisPat <- thisPat[which(!is.na(thisPat$DischargeDateTime)),]
+      rownames(thisPat) <- NULL
+      
+      ### first manipulation: separate each patient's data into discrete segments of stays (ie, admission to transfer, transfer to discharge)
+      
+      ### coerce date columns to POSIXct type  
+      
+      thisPat$AdmitDateTime <- as.POSIXct(thisPat$AdmitDateTime)
+      thisPat$PatientTransferDateTime <- as.POSIXct(thisPat$PatientTransferDateTime)
+      thisPat$DischargeDateTime <- as.POSIXct(thisPat$DischargeDateTime)
+      
+      ### separate stays with and without transfers
+      
+      notrans <- thisPat[which(is.na(thisPat$PatientTransferDateTime)), c("PatientICN", "AdmitDateTime", "DischargeDateTime", "AdmitToSpecialty")]
+      
+      colnames(notrans) <- c("PatientICN", "BeginDateTime", "EndDateTime", "Specialty")
+      rownames(notrans) <- NULL
+      
+      trans <- thisPat[which(!is.na(thisPat$PatientTransferDateTime)), ]
+      rownames(trans) <- NULL
+      
+      ### check if transfer data exists for patient -- only do manipulations if it does
+      
+      if (nrow(trans) > 0) {
+        
+        ### instantiate output dataframe for separated segments of stays from transfer table
+        
+        transSegs <- as.data.frame(matrix(nrow = 0, ncol = 3))
+        colnames(transSegs) <- c("PatientICN", "BeginDateTime", "EndDateTime")
+        
+        ### group transfers by InpatientSID value
+        
+        inpats <- unique(trans$InpatientSID)
+        
+        for (inp in inpats) {
+          
+          ### instantiate intermediary output dataframe
+          
+          theseSegs <- as.data.frame(matrix(nrow = 0, ncol = 4))
+          colnames(theseSegs) <- c("PatientICN", "BeginDateTime", "EndDateTime", "Specialty")
+          
+          ### subset trans to just current InpatientSID
+          
+          thisStay <- trans[which(trans$InpatientSID == inp),]
+          rownames(thisStay) <- NULL
+          
+          ### determine chronological order of transfers in this stay
+          
+          transord <- sort(thisStay$PatientTransferDateTime)
+          
+          ### determine first segment of this stay
+          
+          firstRow <- thisStay[which(thisStay$PatientTransferDateTime == transord[1]), 
+                               c("PatientICN", "AdmitDateTime", "PatientTransferDateTime", "AdmitToSpecialty")]
+          
+          colnames(firstRow) <- c("PatientICN", "BeginDateTime", "EndDateTime", "Specialty")
+          rownames(firstRow) <- NULL
+          
+          ### add first segment row to intermediary data frame
+          
+          theseSegs <- rbind(theseSegs, firstRow, stringsAsFactors = FALSE)
+          
+          ### determine intermediate segments of this stay
+          
+          if (nrow(thisStay) > 1) {
+            
+            for (ord in 2:length(transord)) {
+              
+              ### determine start and end times of segment
+              
+              BDT <- transord[(ord - 1)]
+              EDT <- transord[ord]
+              
+              ### build row of segment data
+              
+              newRow <- as.data.frame(thisStay[which(thisStay$PatientTransferDateTime == transord[ord]), "PatientICN"])
+              newRow$BeginDateTime <- BDT
+              newRow$EndDateTime <- EDT
+              newRow$Specialty <- thisStay[which(thisStay$PatientTransferDateTime == transord[(ord - 1)]), "TransferToSpecialty"]
+              colnames(newRow) <- c("PatientICN", "BeginDateTime", "EndDateTime", "Specialty")
+              rownames(newRow) <- NULL
+              
+              ### add new row to output data frame
+              
+              theseSegs <- rbind(theseSegs, newRow, stringsAsFactors = FALSE)
+              
+            }
+            
+          }
+          
+          ### build empty row to hold data for last segment of this stay
+          
+          newRow <- c(NA, NA, NA, NA)
+          
+          ### add empty row to output data frame
+          
+          theseSegs <- rbind(theseSegs, newRow, stringsAsFactors = FALSE) 
+          
+          ### identify empty row
+          
+          emptyRow <- which(is.na(theseSegs$PatientICN))
+          
+          ### insert values for last segment of this stay into empty new row
+          
+          theseSegs$PatientICN[emptyRow] <- pat
+          
+          ord <- length(transord)
+          theseSegs$BeginDateTime[emptyRow] <- transord[ord]
+          theseSegs$EndDateTime[emptyRow] <- thisStay[which(thisStay$PatientTransferDateTime == transord[ord]), "DischargeDateTime"]
+          theseSegs$Specialty[emptyRow] <- thisStay[which(thisStay$PatientTransferDateTime == transord[ord]), "TransferToSpecialty"]
+          
+          ### assess the segments from this stay for potential concatenation
+          ### this allows for later managing situations in which an acute stay has been recorded both on its own and as part of a nonacute stay
+          
+          ### categorize by specialty
+          
+          theseSegs$Category <- catSpecialties(theseSegs$Specialty)
+         
+          ### retain only segments that are categorized as "acute"
+          
+          theseSegs <- theseSegs[which(theseSegs$Category == "acute"),]
+          rownames(theseSegs) <- NULL
+          
+          ### remove specialty and category columns
+          
+          theseSegs <- theseSegs[, c("PatientICN", "BeginDateTime", "EndDateTime")]
+          
+          ### assess and concatenate theseSegs segments where appropriate
+          ### account for desiredLag parameter
+          
+         if (nrow(theseSegs) > 1) {
+            
+            theseSegs <- assessSegments(theseSegs, desiredLag)
+              
+          }
+          
+          ### add intermediary results to output data frame
+          
+          transSegs <- rbind(transSegs, theseSegs, stringsAsFactors = FALSE) 
+          
+        }
+        
+        ### tidy
+        
+        rm(thisStay)
+        rm(theseSegs)
+        
+      } else {
+        
+        ### although dataframe is empty, adjust columns and column names for what is expected later
+        
+        trans <- trans[,1:3]
+        colnames(trans) <- c("PatientICN", "BeginDateTime", "EndDateTime")
+        
+        transSegs <- trans
+        
+      }
+      
+      ### tidy
+      
+      rm(trans)
+      
+      rownames(transSegs) <- NULL
+      
+      ### categorize segments of stays in notrans data frame as "acute" or "nonacute" by specialty
+      
+      notrans$Category <- catSpecialties(notrans$Specialty)
+      
+      ### retain only segments that are categorized as "acute"
+      
+      notrans <- notrans[which(notrans$Category == "acute"),]
+      rownames(notrans) <- NULL
+      
+      ### remove specialty and category columns
+      
+      notrans <- notrans[, c("PatientICN", "BeginDateTime", "EndDateTime")]
+      
+      ### assess and concatenate transsegs segments where appropriate
+      ### account for desiredLag parameter
+      
+      if (nrow(transSegs) > 1) {
+        
+        transSegs <- assessSegments(transSegs, desiredLag)
+          
+      }
+      
+      ### test for overlapping segments between notrans and transsegs data, if both exist
+      ### transsegs data supersedes notrans data
+      
+      if (nrow(notrans) > 0 && nrow(transSegs) > 0) {
+        
+        for (n in 1:nrow(notrans)) {
+          
+          nBDT <- notrans$BeginDateTime[n]
+          nEDT <- notrans$EndDateTime[n]
+          
+          for (t in 1:nrow(transSegs)) {
+            
+            tBDT <- transSegs$BeginDateTime[t]
+            tEDT <- transSegs$EndDateTime[t]
+            
+            if (nBDT >= tBDT && nBDT <= tEDT) {
+              
+              notrans$deleteRow[n] <- "yes"
+              
+            } else if (nEDT >= tBDT && nEDT <= tEDT) {
+              
+              notrans$deleteRow[n] <- "yes"
+              
+            } else {
+              
+              notrans$deleteRow[n] <- "no"
+              
+            }
+            
+          }
+          
+        }
+        
+        ### retain only the rows in notrans which did not overlap any in transSegs
+        
+        notrans <- notrans[which(notrans$deleteRow == "no"),]
+        
+        ### remove column that flagged rows for deletion
+        
+        notrans <- notrans[, c("PatientICN", "BeginDateTime", "EndDateTime")]
+        
+      }
+      
+      ### put all segments into a single data frame
+      
+      patStays <- rbind(notrans, transSegs, stringsAsFactors = FALSE)
+      
+      ### tidy
+      
+      rm(notrans)
+      rm(transSegs)
+      
+      ### assess all segments for contiguity and concatenate where appropriate
+      ### account for desiredLag parameter
+      
+      if (nrow(patStays) > 1) {
+        
+        patStays <- assessSegments(patStays, desiredLag)
+          
+      }
+      
+      ### calculate length of stay
+      
+      if (nrow(patStays) > 0) {
+        
+        for (n in 1:nrow(patStays)) {
+          
+          LOS <- patStays$EndDateTime[n] - patStays$BeginDateTime[n]
+          units(LOS) <- "days"
+          LOS <- round(as.numeric(LOS))
+          patStays$LOS[n] <- LOS
+          
+          ### tidy
+          
+          rm(LOS)
+          
+        }
+
+        ### write data to output file
+        
+        for (stay in 1:nrow(patStays)) {
+          
+          newrow <- paste(patStays[stay,1], patStays[stay,2], patStays[stay,3], patStays[stay,4], sep = ",")
+          newrow <- paste(newrow, " \n", sep = "")
+          cat(newrow, file = fCon)
+          
+        }
+        
+      }
+
+      ###tidy
+      
+      rm(thisPat)
+      rm(patStays)
+      
+    }
+    
+    ### close output files/connections
+    
+    close(fCon)
+    
+    ### if indicating parameter is TRUE, read in file and save as table in database
+    
+    if (writeToDB) {
+      
+      stays <- read.csv(file = stayfile, header = TRUE)
+      tablename <- paste(today, "_PatientStays", sep = "")
+      sqlSave(con, stays, tablename, rownames = FALSE)
+      
+    }
+    
+    return(TRUE)
+    
+  }
+    
+    
+
+# VINCIserver <- "VHACDWRB03"
+# VINCIdatabase <- "ORD_Gundle_201703063D"
+# desiredLag <- 24
+# desiredLag <- 8
+
+# determineLOS(serverName = "VHACDWRB03", dbName = "ORD_Gundle_201703063D")
+# determineLOS(serverName = "VHACDWRB03", dbName = "ORD_Gundle_201703063D", desiredLag = 8)
+# determineLOS(serverName = "VHACDWRB03", dbName = "ORD_Gundle_201703063D", desiredLag = 2)
+
+
+
+
+
+
+
+
+
+
+
+
+
+################################################################################
+################################################################################
+################################################################################
+
+
