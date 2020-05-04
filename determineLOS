@@ -12,8 +12,6 @@
 ################################################################################
 
 
-
-
 determineLOS <- 
   function(serverName = NULL, dbName = NULL, desiredLag = 24, writeToDB = TRUE) {
     
