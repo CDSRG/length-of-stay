@@ -8,19 +8,20 @@
 ### first draft: 23 January 2020
 ### last edit: 4 May 2020
 
+### The file LOS_Specialty_Category_table.csv lists VINCI CDW medical specialties and our assessment of their acute/nonacute nature.
+### It is guaranteed neither to be exhaustive nor to meet every user's criteria.
+### We recommend that every user review the table and make amendments as necessary to serve each project's goals.
+### Note that the determineLOS() function, as written, will discount everything but stays linked to specialties determined to be "acute" by this file.
+
 ################################################################################
 ################################################################################
+
+fileNameAndPath <- "P:/ORD_Gundle_201703063D/Cecelia Folder/LOS/LOS_Specialty_Category_table.csv"
 
 
 determineLOS <- 
-  function(serverName = NULL, dbName = NULL, desiredLag = 24, writeToDB = TRUE) {
-    
-    ### prepare package dependencies 
+  function(serverName = NULL, dbName = NULL, desiredLag = 24, writeToDB = TRUE, fileNameAndPath = NULL) {
 
-    suppressPackageStartupMessages(require("spatstat"))
-    
-    suppressPackageStartupMessages(require("logger"))
-    
     ################################################################################
     ################################################################################
     ################################################################################
@@ -206,17 +207,12 @@ determineLOS <-
     ### makeLog()
     ### function to install logger package and set up logging file
     
-    makeLog <- function(dbName) {
+    makeLog <- function(dbName, today) {
       
       ### install logger package
       
       suppressPackageStartupMessages(require("logger"))
-      
-      ### acquire current date and format for using in file name
-      
-      today <- Sys.Date()
-      today <- format(today, format = "%Y%m%d")
-      
+
       ### instantiate file
       
       logfile <- paste("P:/", dbName, "/", today, "_identifyCourses.log", sep = "")
@@ -227,6 +223,7 @@ determineLOS <-
     }
     
     ################################################################################
+    ### storeInHash()
     ### function for populating R hash environment with patient stay data
     
     storeInHash <- function(x) {
@@ -268,192 +265,20 @@ determineLOS <-
     }
     
     ################################################################################
+    ###  assignCategories()
     ### function to categorize clinical specialties
     
-    Specialty <- c("NULL",
-                   "*Missing*",
-                   "ACUTE PSYCHIATRY (<45 DAYS)",
-                   "ALCOHOL DEPENDENCE TRMT UNIT",
-                   "AUTHORIZED NON-VA HOSPITAL CARE FOR SC COND.",                                        
-                   "BLIND REHAB",
-                   "CARDIAC INTENSIVE CARE UNIT",
-                   "CARDIAC-STEP DOWN UNIT",
-                   "CARDIOLOGY",
-                   "CNH HOSPICE",
-                   "CNH RESPITE CARE",
-                   "COMMUNITY NURSING HOME FOR NSC DISABILITY(IES)",                                      
-                   "COMMUNITY NURSING HOME FOR SC DISABILITY(IES)",                                       
-                   "DOMICILIARY",
-                   "DOMICILIARY CHV",
-                   "DOMICILIARY PTSD",
-                   "DOMICILIARY SUBSTANCE ABUSE",
-                   "DOMICILIARY SUBSTANCE USE DO",
-                   "EAR, NOSE, THROAT (ENT)",
-                   "ED OBSERVATION",
-                   "EMERG. NON-VA CARE (INPT/OPT) FOR VET. REC. INPT. CARE IN VAMC",                      
-                   "EMERG. NON-VA CARE (INPT/OPT) VET. REC. CARE IN FED. HOSP. AT VA EXP.",               
-                   "EVAL/BRF TRMT PTSD UNIT(EBTPU)",
-                   "GASTROENTEROLOGY",
-                   "GEM ACUTE MEDICINE",
-                   "GEM INTERMEDIATE CARE",
-                   "GEN INTERMEDIATE PSYCH",
-                   "GEN MEDICINE (ACUTE)",
-                   "GENERAL CWT/TR",
-                   "GENERAL SURGERY",
-                   "GENERAL(ACUTE MEDICINE)",
-                   "HEMATOLOGY/ONCOLOGY",
-                   "HIGH INTENSITY GEN PSYCH INPAT",
-                   "HOMELESS CWT/TRANS RESID",
-                   "HOSPICE CARE (INPT.) CONTRACT/SHARING AGREEMENT",                                     
-                   "HOSPICE FOR ACUTE CARE",
-                   "INPATIENT 38 U.S.C. 1725",
-                   "INTERMEDIATE MEDICINE",
-                   "MEDICAL ICU",
-                   "MEDICAL OBSERVATION",
-                   "MEDICAL STEP DOWN",
-                   "METABOLIC",
-                   "NEUROLOGY",
-                   "NEUROLOGY OBSERVATION",
-                   "NEUROSURGERY",
-                   "NH GEM NURSING HOME CARE",
-                   "NH HOSPICE",
-                   "NH LONG STAY DEMENTIA CARE",
-                   "NH LONG STAY SPINAL CORD INJ",
-                   "NH LONG-STAY CONTINUING CARE",
-                   "NH LONG-STAY MH RECOVERY",
-                   "NH RESPITE CARE (NHCU)",
-                   "NH SHORT STAY DEMENTIA CARE",
-                   "NH SHORT STAY REHABILITATION",
-                   "NH SHORT STAY SKILLED NURSING",
-                   "NH SHORT-STAY CONTINUING CARE",
-                   "NH SHORT-STAY MH RECOVERY",
-                   "NHCU",
-                   "NON-VA HOSP. CARE FOR NSC COND. (AK, VI AND HI ONLY)",
-                   "NON-VA HOSP. CARE FOR VET. REC. INPT. CARE IN FED. HOSP. AT VA EXP.",                 
-                   "NON-VA HOSP. CARE FOR WOMEN VETERANS (NO OTHER ELIGIBILITY). INCLUDES MATERNITY CARE",
-                   "OB/GYN",
-                   "OPHTHALMOLOGY",
-                   "ORTHOPEDIC",
-                   "PERIPHERAL VASCULAR",
-                   "PLASTIC SURGERY",
-                   "PSYCH RESID REHAB PROG",
-                   "PSYCH RESID REHAB TRMT PROG",
-                   "PSYCHIATRIC OBSERVATION",
-                   "PSYCHIATRY",
-                   "PTSD RESID REHAB PROG",
-                   "PTSD RESIDENTIAL REHAB PROG",
-                   "PULMONARY, NON-TB",
-                   "REHAB MEDICINE OBSERVATION",
-                   "REHABILITATION MEDICINE",
-                   "RESPITE CARE (MEDICINE)",
-                   "SIPU (SPEC INPT PTSD UNIT)",
-                   "SPINAL CORD INJURY",
-                   "STAR I, II & III",
-                   "SUBSTANCE ABUSE INTERMED CARE",
-                   "SUBSTANCE ABUSE RES TRMT PROG",
-                   "SUBSTANCE ABUSE RESID PROG",
-                   "SUBSTANCE ABUSE TRMT UNIT",
-                   "SURGICAL ICU","SURGICAL OBSERVATION",
-                   "SURGICAL STEPDOWN",
-                   "TELEMETRY",
-                   "THORACIC SURGERY",
-                   "UNAUTHORIZED NON-VA HOSPITAL CARE, SC OR NSC COND",
-                   "UROLOGY",
-                   "VASCULAR")
+    ### prepare package dependencies
     
-    Category <- c("nonacute",
-                  "nonacute",
-                  "acute",
-                  "nonacute",
-                  "acute",
-                  "nonacute", 
-                  "acute",
-                  "acute",
-                  "acute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "nonacute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "nonacute",
-                  "nonacute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "nonacute",
-                  "nonacute",
-                  "acute",
-                  "acute",
-                  "nonacute",
-                  "nonacute",
-                  "acute",
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",   
-                  "nonacute",
-                  "nonacute",
-                  "nonacute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute",
-                  "acute")
+    suppressPackageStartupMessages(require("spatstat"))
     
-    catSpecialties <- lut(inputs = Specialty, outputs = Category)
+    ### load file
+    
+    losFile <- read.csv(fileNameAndPath, header = TRUE, stringsAsFactors = FALSE)
+    
+    ### build lut function for categorizing specialties
+    
+    assignCategories <- lut(inputs = losFile$Specialty, outputs = losFile$Category)
     
     ################################################################################
     ### function to assess segments of inpatient stays for contiguity and 
@@ -795,35 +620,13 @@ determineLOS <-
     ################################################################################
     ################################################################################
     ################################################################################
-    ### prepare output files
+    ### prepare output file
     
     ### acquire current date and format for using in output file names
     
     today <- Sys.Date()
     today <- format(today, format = "%Y%m%d")
-    
-    ### create constant holding the time of one second past midnight (no date) to be used later in manipulating data from the fee-basis tables
-    
-    midnight <- as.POSIXct("2020-01-01 00:00:01")
-    midnight <- format(midnight, format = "%H:%M:%S")
-    
-    ### instantiate database and server variables from provided parameters
-    
-    VINCIserver <- serverName
-    VINCIdatabase <- dbName
-    
-    ### build connection name and establish connection
-    
-    conString <- paste("driver={SQL Server};server=", VINCIserver, ";database=", VINCIdatabase, ";trusted_connection=TRUE", sep = "")
-    con <- odbcDriverConnect(connection = conString)
-    
-    ################################################################################
-    ### establish logging and output log file
-    
-    logfile <- paste("P:/", VINCIdatabase, "/", today, "_determineLOS.log", sep = "")
-    log_appender(appender_file(logfile), index=2)
-    
-    ################################################################################
+
     ### establish file to hold all patient stays
     
     stayfile <- paste("P:/", VINCIdatabase, "/", today, "_PatientStays.csv", sep = "")
@@ -833,7 +636,6 @@ determineLOS <-
     fileHeader <- paste("PatientICN", "BeginDateTime", "EndDateTime", "LOS", sep = ",")
     fileHeader <- paste(fileHeader, " \n", sep = "")
     cat(fileHeader, file = fCon)
-    
     
     ################################################################################
     ################################################################################
@@ -880,6 +682,13 @@ determineLOS <-
     ################################################################################
     ################################################################################
     ################################################################################
+    ### establish logging file
+    
+    makeLog(dbName, today)
+    
+    ### establish database connection
+    
+    makeCon(serverName, dbName)
     
     ### create environment
     
@@ -1074,7 +883,7 @@ determineLOS <-
       
       ### categorize segments of stays in notrans data frame as "acute" or "nonacute" by specialty
       
-      notrans$Category <- catSpecialties(notrans$Specialty)
+      notrans$Category <- assignCategories(notrans$Specialty)
       
       ### retain only segments that are categorized as "acute"
       
