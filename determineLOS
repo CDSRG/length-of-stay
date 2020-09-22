@@ -1163,6 +1163,8 @@ determineLOS <- function(serverName = NULL, dbName = NULL, projectName = NULL, d
     
     stayfile <- summary(fCon)$description
     stays <- read.csv(file = stayfile, header = TRUE)
+    today <- Sys.Date()
+    today <- format(today, format = "%Y%m%d")
     tablename <- paste(today, "_PatientStays", sep = "")
     sqlSave(con, stays, tablename, rownames = FALSE)
     
